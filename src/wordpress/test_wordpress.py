@@ -106,19 +106,10 @@ def test_get_pages():
   credential.upload_pages()
 
 def test_get_multisite_pages():
-  session = wordpress.api.make_kerberos_session()
-  configParser = configparser.ConfigParser()
-  configParser.read('comsecrets.ini')
-  site_url = urllib.parse.urljoin(configParser['WordPressMultisite']['multisite_base_url'], configParser['WordPressMultisite']['site_path'])
-  wpv2 = urllib.parse.urljoin(site_url, 'wp-json/wp/v2/')
-  response = requests.get(urllib.parse.urljoin(wpv2, 'pages'), auth=session.auth, proxies=session.proxies, verify=session.cert)
-  assert response.status_code == 200
-  assert response.headers['Content-Type'] == 'application/json; charset=UTF-8'
-  assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
-  # Access-Control-Allow-Headers sounds important but doesn't seem to matter:
-  assert 'Content-Type' not in response.request.headers
-  assert len(response.request.headers) >= 4
-  wordpress.api.save_pages(response.json(), configParser['WordPressMultisite']['site_path'])
+  site = wordpress.api.WordPressMultisiteSite()
+  site.download_pages()
+  credential = wordpress.api.WordPressMultisiteCredential(site)
+  credential.upload_pages(site.directory_to_save_pages(), site.make_session())
 
 def test_multisite_acf():
   session = wordpress.api.make_kerberos_session()
@@ -126,14 +117,14 @@ def test_multisite_acf():
   configParser.read('comsecrets.ini')
   site_url = urllib.parse.urljoin(configParser['WordPressMultisite']['multisite_base_url'], configParser['WordPressMultisite']['site_path'])
   acfv3 = urllib.parse.urljoin(site_url, 'wp-json/acf/v3/')
-  response = requests.get(urllib.parse.urljoin(acfv3, 'pages/225'), auth=session.auth, proxies=session.proxies, verify=session.cert)
+  response = requests.get(urllib.parse.urljoin(acfv3, 'pages/221'), auth=session.auth, proxies=session.proxies, verify=session.cert)
   assert response.status_code == 200
   assert response.headers['Content-Type'] == 'application/json; charset=UTF-8'
   assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
   assert 'Content-Type' not in response.request.headers
   assert len(response.request.headers) >= 4
   #raise Exception(response.json())
-  # It appears that ACF endpoint only returns top-level pages with no parent?
+  # It appears that /acf/v3/pages/ only returns top-level pages with no parent? to get the ACF content, have to request each page individually?
   #wordpress.api.save_pages(response.json(), configParser['WordPressMultisite']['site_path'])
 
 

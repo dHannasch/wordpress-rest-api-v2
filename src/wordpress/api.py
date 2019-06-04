@@ -12,6 +12,7 @@ import selenium.webdriver
 from selenium.webdriver.support import expected_conditions # must be from-import?
 import sys
 import os
+import glob, re
 import json
 import itertools
 import difflib
@@ -48,6 +49,11 @@ def get_blog_url() -> str:
   configParser.read('comsecrets.ini')
   return configParser['WordPressCom']['url']
 
+def get_site_path() -> str:
+  configParser = configparser.ConfigParser()
+  configParser.read('comsecrets.ini')
+  return configParser['WordPressMultisite']['site_path']
+
 def get_proxies() -> dict:
   configParser = configparser.ConfigParser()
   configParser.read('comsecrets.ini')
@@ -64,25 +70,6 @@ def wordpress_link_to_file_path(link):
   assert path[-1] == '/'
   # We strip the *leading* (but not the trailing) slash.
   return path
-
-def save_pages(pages, directoryToSaveIn='savedPages'):
-  # https://developer.wordpress.org/rest-api/reference/pages/
-  # page['parent'] is an integer like page['id']
-  # page['slug'] is only the very last child part of page['link']
-  os.makedirs(directoryToSaveIn, exist_ok=True)
-  with open(os.path.join(directoryToSaveIn, 'pages.json'), 'w') as pagesFile:
-    json.dump(pages, pagesFile)
-  for page in pages:
-    directoryToSaveThisPage = os.path.join(directoryToSaveIn, wordpress_link_to_file_path(page['link']))
-    assert directoryToSaveThisPage[-1] == '/'
-    os.makedirs(directoryToSaveThisPage, exist_ok=True)
-    content = page['content']
-    assert not content['protected']
-    assert len(content.keys()) == 2
-    with open(os.path.join(directoryToSaveThisPage, 'content.rendered.html'), 'w') as pageFile:
-      pageFile.write(content['rendered'])
-    with open(os.path.join(directoryToSaveThisPage, 'id'), 'w') as IDfile:
-      IDfile.write(str(page['id']))
 
 def make_session_without_credential() -> requests.Session:
   """
@@ -108,8 +95,115 @@ def print_diff(a, b):
         elif s[0]=='+':
             print(u'Add "{}" to position {}'.format(s[-1],i))
 
-class WordPressComCredential:
+def replace_linefeeds(string):
+  linefeedRE = re.compile(r'(?<!\r)\n')
+  return linefeedRE.sub('\r\n', string)
+
+class WordPressCredential(metaclass=abc.ABCMeta):
+  def __init__(self, site):
+    self.site = site
+
+  @abc.abstractmethod
+  def make_session(self):
+    return self.site.make_session()
+  def upload_pages(self, directoryOfPages=None, session: requests.Session = None):
+    if not directoryOfPages:
+      directoryOfPages = self.site.directory_to_save_pages()
+    session = session if session is not None else self.make_session()
+    with open(os.path.join(directoryOfPages, 'pages.json'), 'r') as pagesFile:
+      pages = json.load(pagesFile)
+    for root, dirs, files in itertools.dropwhile(lambda t: t[0]==directoryOfPages, os.walk(directoryOfPages)):
+      if 'content.rendered.html' not in files:
+        continue
+      assert 'id' in files
+      ID = int(open(os.path.join(root, 'id'), 'r').read())
+      matchingPages = [page for page in pages if page['id'] == ID]
+      assert len(matchingPages) == 1
+      recordOfPage = matchingPages[0]
+      if wordpress_link_to_file_path(recordOfPage['link']) != os.path.relpath(root, directoryOfPages) + '/':
+        raise Exception(recordOfPage['link'], wordpress_link_to_file_path(recordOfPage['link']), os.path.relpath(root, directoryOfPages), root)
+      pagePath = os.path.relpath(root, directoryOfPages) + '/'
+      if pagePath == 'contact/':
+        continue
+      content = open(os.path.join(root, 'content.rendered.html'), 'r').read()
+      pageURL = urllib.parse.urljoin(self.site.pages_url(), str(ID))
+      # https://stackoverflow.com/questions/10893374/python-confusions-with-urljoin
+      response = requests.post(pageURL,
+                               auth=session.auth,#headers=session.headers,
+                               proxies=session.proxies, verify=session.cert,
+                               json={'content': content})
+      if response.status_code != 200:
+        raise Exception(pagePath, pageURL, response, response.headers, response.content)
+      responseJSON = response.json()
+      assert responseJSON['id'] == ID
+      assert wordpress_link_to_file_path(responseJSON['link']) == pagePath
+      assert responseJSON['content']['raw'] == content
+      self.do_extra_stuff_when_uploading_page(ID, root)
+  def do_extra_stuff_when_uploading_page(self, ID: int, directoryPageSavedIn):
+    pass
+
+class WordPressMultisiteCredential(WordPressCredential):
+  def make_session(self):
+    return self.site.make_session()
+  def do_extra_stuff_when_uploading_page(self, ID: int, directoryPageSavedIn, session: requests.Session=None):
+    session = session if session is not None else self.make_session()
+    if os.path.basename(directoryPageSavedIn) == 'calendar':
+      return
+    elif os.path.basename(directoryPageSavedIn) == 'page-2a':
+      return
+    elif os.path.basename(directoryPageSavedIn) == '2-a-ii-another-page-under-2-a':
+      return
+    sections = list()
+    acfSectionRE = re.compile(r'acf.sections.(\d+).(\w+).html')
+    sectionNumber = 0
+    matches = [filename for filename in os.listdir(directoryPageSavedIn) if filename.startswith('acf.sections.' + str(sectionNumber))]
+    while len(matches) > 0:
+      section = dict()
+      for filename in matches:
+        matchObj = acfSectionRE.match(filename)
+        assert int(matchObj.group(1)) == sectionNumber
+        contentKey = matchObj.group(2)
+        section[contentKey] = open(os.path.join(directoryPageSavedIn, filename), 'r').read()
+        #section[contentKey] = replace_linefeeds(section[contentKey])
+        #if section[contentKey][-2:] == '\r\n':
+          # I have no idea why, but although they have \r\n everywhere else, they have \n at the end.
+          # I'm going to leave it like that.
+        #  section[contentKey] = section[contentKey][:-2] + '\n'
+        # Looking more, sometimes they just have \n, so I'm just not going to worry about it.
+      if 'large_text' in section:
+        section['acf_fc_layout'] = 'large_text'
+      elif 'content' in section:
+        section['acf_fc_layout'] = 'text'
+      else:
+        raise Exception()
+      sections.append(section)
+      sectionNumber += 1
+      matches = [filename for filename in os.listdir(directoryPageSavedIn) if filename.startswith('acf.sections.' + str(sectionNumber))]
+    if len(sections) == 0:
+      assert sectionNumber == 0
+      return
+    pageURL = self.site.get_page_acf_url(ID)
+    response = requests.get(pageURL, auth=session.auth, proxies=session.proxies, verify=session.cert)
+    response = requests.post(pageURL,
+                             auth=session.auth,
+                             proxies=session.proxies, verify=session.cert,
+                             json={'acf': {'sections': sections}})
+    if response.status_code != 200:
+      raise Exception(directoryPageSavedIn, pageURL, response, response.headers, response.content)
+    responseJSON = response.json()
+    assert len(responseJSON['acf']['sections']) == len(sections)
+    for s1,s2 in zip(responseJSON['acf']['sections'], sections):
+      assert s1.keys() == s2.keys()
+      for k in s1.keys():
+        if s1[k] != s2[k] and s1[k].replace('\r\n', '\n') != s2[k].replace('\r\n', '\n'):
+          print_diff(s1[k], s2[k])
+          print('\n' + s1[k] + '\n' + s2[k])
+          print('\n' + repr(s1[k]) + '\n' + repr(s2[k]))
+          raise Exception(k)
+
+class WordPressComCredential(WordPressCredential):
   def __init__(self):
+    super().__init__(WordPressComSite())
     self.configParser = configparser.ConfigParser()
     self.configParser.read('comsecrets.ini')
     try:
@@ -118,7 +212,6 @@ class WordPressComCredential:
       raise KeyError('Token not found in comsecrets.ini!')
     self.client_id = self.configParser['WordPressCom']['client_id']
     self.blog_id = self.configParser['WordPressCom']['blog_id']
-    self.site = WordPressComSite()
   def get_user_name(self):
     return self.configParser['WordPressCom']['user_name']
   def get_password(self):
@@ -133,6 +226,11 @@ class WordPressComCredential:
     """
     ret = make_session_without_credential()
     ret.headers = {"Authorization": "Bearer " + self.rawToken}
+    client = oauthlib.oauth2.MobileApplicationClient(self.client_id, token_type='bearer', access_token=self.rawToken)
+    # https://github.com/requests/requests-oauthlib/blob/master/requests_oauthlib/oauth2_auth.py
+    ret.auth = requests_oauthlib.OAuth2(self.client_id, #client,
+                                    token={'access_token': self.rawToken, 'token_type': 'bearer'},
+                                    )
     return ret
 
   def get_app_url(self):
@@ -221,42 +319,6 @@ class WordPressComCredential:
     #  raise Exception(access_token, GetRecordingHandler.URLs[-1])
     #  throws an exception because http://localhost is HTTP rather than HTTPS
 
-  def upload_pages(self, directoryOfPages=None):
-    if not directoryOfPages:
-      directoryOfPages = self.site.blog_url
-    session = self.make_session()
-    with open(os.path.join(directoryOfPages, 'pages.json'), 'r') as pagesFile:
-      pages = json.load(pagesFile)
-    for root, dirs, files in itertools.dropwhile(lambda t: t[0]==directoryOfPages, os.walk(directoryOfPages)):
-      assert 'content.rendered.html' in files
-      assert 'id' in files
-      ID = int(open(os.path.join(root, 'id'), 'r').read())
-      matchingPages = [page for page in pages if page['id'] == ID]
-      assert len(matchingPages) == 1
-      recordOfPage = matchingPages[0]
-      if wordpress_link_to_file_path(recordOfPage['link']) != os.path.relpath(root, directoryOfPages) + '/':
-        raise Exception(recordOfPage['link'], wordpress_link_to_file_path(recordOfPage['link']), os.path.relpath(root, directoryOfPages), root)
-      pagePath = os.path.relpath(root, directoryOfPages) + '/'
-      if pagePath == 'contact/':
-        continue
-      content = open(os.path.join(root, 'content.rendered.html'), 'r').read()
-      pageURL = urllib.parse.urljoin(self.site.pages_url(), str(ID))
-      # https://stackoverflow.com/questions/10893374/python-confusions-with-urljoin
-      client = oauthlib.oauth2.MobileApplicationClient(self.client_id, token_type='bearer', access_token=self.rawToken)
-      # https://github.com/requests/requests-oauthlib/blob/master/requests_oauthlib/oauth2_auth.py
-      auth = requests_oauthlib.OAuth2(self.client_id, #client,
-                                      token={'access_token': self.rawToken, 'token_type': 'bearer'},
-                                      )
-      response = requests.post(pageURL,
-                               auth=auth,#headers=session.headers,
-                               proxies=session.proxies, verify=session.cert,
-                               json={'content': content})
-      if response.status_code != 200:
-        raise Exception(pagePath, pageURL, response, response.headers, response.content)
-      responseJSON = response.json()
-      assert responseJSON['id'] == ID
-      assert wordpress_link_to_file_path(responseJSON['link']) == pagePath
-      assert responseJSON['content']['raw'] == content
 
 class WordPressSite(metaclass=abc.ABCMeta):
   @abc.abstractmethod
@@ -284,11 +346,47 @@ class WordPressSite(metaclass=abc.ABCMeta):
   def get_pages(self, session: requests.Session = None):
     # https://developer.wordpress.org/rest-api/reference/pages/
     session = session if session is not None else self.make_session()
-    return requests.get(self.pages_url(), proxies=session.proxies, verify=session.cert)
+    response = requests.get(self.pages_url(), auth=session.auth, proxies=session.proxies, verify=session.cert)
+    if response.status_code != 200:
+      raise Exception(self.pages_url(), session, response)
+    assert response.headers['Content-Type'] == 'application/json; charset=UTF-8'
+    assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
+    return response
 
   @abc.abstractmethod
   def get_pages_json(self, session: requests.Session=None):
     pass
+  @abc.abstractmethod
+  def download_pages_nodefaults(self, directoryToSaveIn, session: requests.Session):
+    pass
+  @abc.abstractmethod
+  def directory_to_save_pages(self):
+    return 'savedPages'
+  def download_pages(self, directoryToSaveIn=None, session: requests.Session = None):
+    return self.download_pages_nodefaults(directoryToSaveIn if directoryToSaveIn else self.directory_to_save_pages(),
+                                   session if session is not None else self.make_session())
+
+  def do_extra_stuff_when_saving_page(self, page, directoryToSaveThisPage):
+    pass
+  def save_pages(self, pages, directoryToSaveIn='savedPages'):
+    # https://developer.wordpress.org/rest-api/reference/pages/
+    # page['parent'] is an integer like page['id']
+    # page['slug'] is only the very last child part of page['link']
+    os.makedirs(directoryToSaveIn, exist_ok=True)
+    with open(os.path.join(directoryToSaveIn, 'pages.json'), 'w') as pagesFile:
+      json.dump(pages, pagesFile)
+    for page in pages:
+      directoryToSaveThisPage = os.path.join(directoryToSaveIn, wordpress_link_to_file_path(page['link']))
+      assert directoryToSaveThisPage[-1] == '/'
+      os.makedirs(directoryToSaveThisPage, exist_ok=True)
+      content = page['content']
+      assert not content['protected']
+      assert len(content.keys()) == 2
+      with open(os.path.join(directoryToSaveThisPage, 'content.rendered.html'), 'w') as pageFile:
+        pageFile.write(content['rendered'])
+      with open(os.path.join(directoryToSaveThisPage, 'id'), 'w') as IDfile:
+        IDfile.write(str(page['id']))
+      self.do_extra_stuff_when_saving_page(page, directoryToSaveThisPage)
 
 class WordPressComSite(WordPressSite):
   def __init__(self, blog_url=get_blog_url()):
@@ -305,20 +403,99 @@ class WordPressComSite(WordPressSite):
   def get_pages_json(self, session: requests.Session = None):
     session = session if session is not None else self.make_session()
     response = self.get_pages()
-    assert response.status_code == 200
-    assert response.headers['Content-Type'] == 'application/json; charset=UTF-8'
     assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
     # Access-Control-Allow-Headers sounds important but doesn't seem to matter:
     assert 'Authorization' not in response.request.headers
     assert 'Content-Type' not in response.request.headers
     assert len(response.request.headers) >= 4
     return response.json()
-  def download_pages(self, directoryToSaveIn=None, session: requests.Session = None):
-    session = session if session is not None else self.make_session()
-    if not directoryToSaveIn:
-      directoryToSaveIn = self.blog_url
-    save_pages(self.get_pages_json(), directoryToSaveIn)
+  def directory_to_save_pages(self):
+    return self.blog_url
+  def download_pages_nodefaults(self, directoryToSaveIn, session: requests.Session):
+    self.save_pages(self.get_pages_json(), directoryToSaveIn)
 
+class WordPressMultisiteSite(WordPressSite):
+  def __init__(self, site_path=get_site_path()):
+    self.site_path = site_path
+  def site_url(self) -> str:
+    configParser = configparser.ConfigParser()
+    configParser.read('comsecrets.ini')
+    site_url = urllib.parse.urljoin(configParser['WordPressMultisite']['multisite_base_url'], self.site_path)
+    return site_url
+  def base_wp_v2_url(self) -> str:
+    wpv2 = urllib.parse.urljoin(self.site_url(), 'wp-json/wp/v2/')
+    return wpv2
+  def base_acf_v3_url(self) -> str:
+    return urllib.parse.urljoin(self.site_url(), 'wp-json/acf/v3/')
+  def make_session(self) -> requests.Session:
+    """
+    requests_kerberos sometimes stops working until the computer is rebooted.
+    Accessing pages with Firefox also stops working,
+    but you can just re-enter the Kerberos password to make it work again.
+    There's probably some way to make requests_kerberos start working again too.
+    """
+    return make_kerberos_session()
+
+  def get_pages_json(self, session: requests.Session = None):
+    session = session if session is not None else self.make_session()
+    response = self.get_pages()
+    assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
+    # Access-Control-Allow-Headers sounds important but doesn't seem to matter:
+    assert 'Content-Type' not in response.request.headers
+    assert len(response.request.headers) >= 4
+    return response.json()
+  def get_page_acf_url(self, IDnumber: int):
+    pagesURL = urllib.parse.urljoin(self.base_acf_v3_url(), 'pages/')
+    return urllib.parse.urljoin(pagesURL, str(IDnumber))
+  def get_page_acf_sections(self, IDnumber: int, session: requests.Session = None):
+    session = session if session is not None else self.make_session()
+    response = requests.get(self.get_page_acf_url(IDnumber), auth=session.auth, proxies=session.proxies, verify=session.cert)
+    assert response.status_code == 200
+    assert response.headers['Content-Type'] == 'application/json; charset=UTF-8'
+    assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
+    assert 'Content-Type' not in response.request.headers
+    assert len(response.request.headers) >= 4
+    responseJSON = response.json()
+    sections = responseJSON['acf']['sections']
+    if not sections:
+      # A page can be empty, like the top-level Python package index page, in which case it has 'sections': False.
+      return
+    assert len(sections) > 0
+    assert len(sections) <= 2
+    for section in sections:
+      if section['acf_fc_layout'] == 'large_text':
+        assert 'large_text' in section
+    return sections
+  @staticmethod
+  def save_page_acf_sections(sections, directoryToSaveThisPage):
+    if not sections:
+      raise ValueError(sections)
+    with open(os.path.join(directoryToSaveThisPage, 'sections.json'), 'w') as sectionsFile:
+      json.dump(sections, sectionsFile)
+    for i,section in enumerate(sections):
+      if section['acf_fc_layout'] == 'large_text':
+        content_keys = ('large_text',)
+      elif section['acf_fc_layout'] == 'text':
+        content_keys = ('content', 'section_title')
+      else:
+        raise Exception(sections)
+      if not all(content_key in section for content_key in content_keys):
+        raise Exception(content_keys, section)
+      assert section.keys() == set(content_keys).union({'acf_fc_layout'})
+      for content_key in content_keys:
+        content = section[content_key]
+        filename = 'acf.sections.' + str(i) + '.' + content_key + '.html'
+        with open(os.path.join(directoryToSaveThisPage, filename), 'w') as pageFile:
+          pageFile.write(content)
+
+  def directory_to_save_pages(self):
+    return self.site_path
+  def download_pages_nodefaults(self, directoryToSaveIn, session: requests.Session):
+    self.save_pages(self.get_pages_json(), directoryToSaveIn)
+  def do_extra_stuff_when_saving_page(self, page, directoryToSaveThisPage):
+    sections = self.get_page_acf_sections(page['id'])
+    if sections:
+      self.save_page_acf_sections(sections, directoryToSaveThisPage)
 
       
 
