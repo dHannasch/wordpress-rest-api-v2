@@ -183,11 +183,13 @@ class WordPressMultisiteCredential(WordPressCredential):
       assert sectionNumber == 0
       return
     pageURL = self.site.get_page_acf_url(ID)
-    response = requests.get(pageURL, auth=session.auth, proxies=session.proxies, verify=session.cert)
+    #response = requests.get(pageURL, auth=session.auth, proxies=session.proxies, verify=session.cert)
     response = requests.post(pageURL,
                              auth=session.auth,
                              proxies=session.proxies, verify=session.cert,
-                             json={'acf': {'sections': sections}})
+                             #json={'acf': {'sections': sections}},
+                             json={'fields': {'sections': sections}}
+                             )
     if response.status_code != 200:
       raise Exception(directoryPageSavedIn, pageURL, response, response.headers, response.content)
     responseJSON = response.json()
@@ -497,6 +499,12 @@ class WordPressMultisiteSite(WordPressSite):
     if sections:
       self.save_page_acf_sections(sections, directoryToSaveThisPage)
 
-      
+
+
+def upload_to_multisite():
+  site = WordPressMultisiteSite()
+  credential = WordPressMultisiteCredential(site)
+  credential.upload_pages(site.directory_to_save_pages(), site.make_session())
+
 
 

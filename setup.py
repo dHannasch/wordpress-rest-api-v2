@@ -64,6 +64,11 @@ if __name__ == '__main__':
       packages=setuptools.find_packages('src'),
       package_dir={'': 'src'},
       package_data=packageData,
+      entry_points={
+        'console_scripts': [
+          'upload_to_multisite = wordpress.api:upload_to_multisite',
+        ],
+      },
       install_requires=[
           'pytest',
       ],
