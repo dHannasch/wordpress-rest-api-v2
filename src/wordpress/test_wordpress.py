@@ -6,12 +6,18 @@ import requests_kerberos
 import urllib.parse
 import subprocess
 import webbrowser
+import pytest
 
 
+@pytest.mark.com
 def test_authorization_url():
+  """
+  This is also a good way to get the blog_id and rawtoken if you know a username and password but not those.
+  """
   credential = wordpress.api.WordPressComCredential()
   credential.visit_authorization_url()
 
+@pytest.mark.com
 def test_head():
   session = wordpress.api.make_session_without_credential()
   response = requests.head(r'https://public-api.wordpress.com/wp/v2/', proxies=session.proxies, verify=session.cert)
@@ -32,6 +38,7 @@ def test_multisite_head():
   assert response.headers['Content-Type'] == 'application/json; charset=UTF-8'
   assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
 
+@pytest.mark.com
 def test_root():
   session = wordpress.api.make_session_without_credential()
   response = requests.get(r'https://public-api.wordpress.com/wp/v2/', proxies=session.proxies, verify=session.cert)
@@ -62,6 +69,7 @@ def test_multisite_root():
 # so you can't e.g. get a list of sites from /sites/ or any such thing.
 # It was suggested, but never implemented: https://make.wordpress.org/core/2017/01/25/providing-a-rest-api-sites-endpoint-for-multisite/
 
+@pytest.mark.com
 def test_credential():
   credential = wordpress.api.WordPressComCredential()
   tokenValid = requests.get(credential.get_verification_url(), proxies=wordpress.api.get_proxies(), verify=wordpress.api.get_verify())
@@ -70,9 +78,10 @@ def test_credential():
   assert tokenValidJSON['client_id'] == credential.client_id
   configParser = configparser.ConfigParser()
   configParser.read('comsecrets.ini')
-  assert tokenValidJSON['user_id'] == configParser['WordPressCom']['user_id']
   assert tokenValidJSON['blog_id'] == configParser['WordPressCom']['blog_id']
+  assert tokenValidJSON['user_id'] == configParser['WordPressCom']['user_id']
 
+@pytest.mark.com
 def test_v1_me():
   session = wordpress.api.WordPressComCredential().make_session()
   response = requests.get(r'https://public-api.wordpress.com/rest/v1/me/',
@@ -87,6 +96,7 @@ def test_v1_me():
   assert responseJSON['ID'] == int(configParser['WordPressCom']['user_id'])
   assert responseJSON['primary_blog'] == int(configParser['WordPressCom']['blog_id'])
 
+@pytest.mark.com
 def test_get_posts():
   site = wordpress.api.WordPressComSite()
   response = site.get_posts(wordpress.api.make_session_without_credential())
@@ -99,10 +109,12 @@ def test_get_posts():
   assert len(response.request.headers) >= 4
   posts = response.json()
 
+@pytest.mark.com
 def test_get_pages():
   site = wordpress.api.WordPressComSite()
-  site.download_pages()
   credential = wordpress.api.WordPressComCredential()
+  # temporary hack so we have a working test while refactoring with the knowledge that we need edit permissions to retrieve raw pages:
+  site.download_pages(session=credential.make_session())
   credential.upload_pages()
 
 def test_get_multisite_pages():

@@ -70,7 +70,8 @@ if __name__ == '__main__':
         ],
       },
       install_requires=[
-          'pytest',
+          'requests_oauthlib',
+          'requests_kerberos',
       ],
       setup_requires=[
               'pytest-runner',

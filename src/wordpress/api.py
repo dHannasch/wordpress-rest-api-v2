@@ -16,6 +16,8 @@ import glob, re
 import json
 import itertools
 import difflib
+import bs4
+import time
 
 """
 When having authentication issues, we have options:
@@ -25,6 +27,10 @@ del prepped.headers['Content-Type']
 """
 
 class GetRecordingHandler(http.server.BaseHTTPRequestHandler):
+  """
+  Because for whatever reason the arguments are not being properly included in the request,
+  the handler needs to actually have access to the driver and pull the current_url from the driver.
+  """
   driver = None
   URLs = list()
   def do_GET(self):
@@ -33,6 +39,7 @@ class GetRecordingHandler(http.server.BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(bytes("<html><head><title>Title goes here.</title></head>", "utf-8"))
     self.wfile.write(bytes("<body><p>This is a test.</p>", "utf-8"))
+    self.wfile.write(bytes("GetRecordingHandler magic text", "utf-8"))
     assert self.path == '/'
     # arguments *should* be in self.path but are not: https://stackoverflow.com/questions/8928730/processing-http-get-input-parameter-on-server-side-in-python
     self.wfile.write(bytes("<p>You accessed path: %s</p>" % self.path, "utf-8"))
@@ -57,12 +64,20 @@ def get_site_path() -> str:
 def get_proxies() -> dict:
   configParser = configparser.ConfigParser()
   configParser.read('comsecrets.ini')
-  return {'http': configParser['Proxies']['http'], 'https': configParser['Proxies']['https']}
+  proxies = dict()
+  if 'http' in configParser['Proxies'] and configParser['Proxies']['http'] != "None":
+    proxies['http'] = configParser['Proxies']['http']
+  if 'https' in configParser['Proxies'] and configParser['Proxies']['https'] != "None":
+    proxies['https'] = configParser['Proxies']['https']
+  return proxies
 
 def get_verify() -> str:
   configParser = configparser.ConfigParser()
   configParser.read('comsecrets.ini')
-  return configParser['Proxies']['ssl_verify']
+  pathtopem = configParser['Proxies']['ssl_verify']
+  if pathtopem == "None":
+    return None
+  return pathtopem
 
 def wordpress_link_to_file_path(link):
   parseResult = urllib.parse.urlparse(link)
@@ -113,7 +128,7 @@ class WordPressCredential(metaclass=abc.ABCMeta):
     with open(os.path.join(directoryOfPages, 'pages.json'), 'r') as pagesFile:
       pages = json.load(pagesFile)
     for root, dirs, files in itertools.dropwhile(lambda t: t[0]==directoryOfPages, os.walk(directoryOfPages)):
-      if 'content.rendered.html' not in files:
+      if 'content.raw.html' not in files:
         continue
       assert 'id' in files
       ID = int(open(os.path.join(root, 'id'), 'r').read())
@@ -125,7 +140,7 @@ class WordPressCredential(metaclass=abc.ABCMeta):
       pagePath = os.path.relpath(root, directoryOfPages) + '/'
       if pagePath == 'contact/':
         continue
-      content = open(os.path.join(root, 'content.rendered.html'), 'r').read()
+      content = open(os.path.join(root, 'content.raw.html'), 'r').read()
       pageURL = urllib.parse.urljoin(self.site.pages_url(), str(ID))
       # https://stackoverflow.com/questions/10893374/python-confusions-with-urljoin
       response = requests.post(pageURL,
@@ -137,7 +152,23 @@ class WordPressCredential(metaclass=abc.ABCMeta):
       responseJSON = response.json()
       assert responseJSON['id'] == ID
       assert wordpress_link_to_file_path(responseJSON['link']) == pagePath
-      assert responseJSON['content']['raw'] == content
+      if responseJSON['content']['raw'] != content:
+        with open('tmp.html', 'w') as tmpfile:
+          tmpfile.write(responseJSON['content']['raw'])
+        # https://www.reddit.com/r/learnpython/comments/2sbth2/comparing_xmlhtml_files_in_beautiful_soup/
+        responseSoup = bs4.BeautifulSoup(responseJSON['content']['raw'])
+        savedSoup = bs4.BeautifulSoup(content)
+        for responseString, savedString in zip(responseSoup.strings, savedSoup.strings):
+          if responseString != savedString:
+            raise Exception("{} in {} changed to {}".format(savedString, savedString.parent.name, responseString))
+        #for line in difflib.unified_diff(content.splitlines(), responseJSON['content']['raw'].splitlines(),
+                                         fromfile='saved.content.html', tofile='returned.content.html',
+                                         n=0, lineterm=''):
+        #  print(line)
+        #differ = difflib.Differ()
+        #print('\n'.join(differ.compare(list(responseSoup.stripped_strings), list(savedSoup.stripped_strings))))
+        #print('saved HTML:\n', content)
+        raise Exception(responseJSON)
       self.do_extra_stuff_when_uploading_page(ID, root)
   def do_extra_stuff_when_uploading_page(self, ID: int, directoryPageSavedIn):
     pass
@@ -246,6 +277,7 @@ class WordPressComCredential(WordPressCredential):
 
   def get_verification_url(self):
     return r'https://public-api.wordpress.com/oauth2/token-info?client_id={}&token={}'.format(self.client_id, self.get_encoded_token())
+
   def get_authorization_url(self):
     redirect_uri = r'https%3a%2f%2fexample.com'
     # Since the token is going to be right there in the URL, using HTTPS doesn't make us any more secure.
@@ -275,6 +307,8 @@ class WordPressComCredential(WordPressCredential):
     return ret
 
   def visit_authorization_url(self):
+    if self.client_id == '12345':
+      raise Exception('Unless your client_id really is 12345, ' + self.get_authorization_url() + ' is not going to work.')
     server = http.server.HTTPServer(('localhost', 8080), GetRecordingHandler)
     executable_path=os.path.join(os.path.dirname(sys.executable), 'geckodriver')
     GetRecordingHandler.driver = selenium.webdriver.Firefox(executable_path=executable_path)
@@ -282,6 +316,7 @@ class WordPressComCredential(WordPressCredential):
     usernameTextBox = selenium.webdriver.support.ui.WebDriverWait(GetRecordingHandler.driver, 5).until(
         expected_conditions.presence_of_element_located((
             selenium.webdriver.common.by.By.ID, 'usernameOrEmail')))
+    # If there is a mismatch in the redirect_url, the usernameTextBox will not appear.
     usernameTextBox.send_keys(self.get_user_name())
     usernameTextBox.submit()
     passwordTextBox = selenium.webdriver.support.ui.WebDriverWait(GetRecordingHandler.driver, 5).until(
@@ -294,7 +329,6 @@ class WordPressComCredential(WordPressCredential):
             selenium.webdriver.common.by.By.ID, 'approve')))
     approveButton.click()
     server.handle_request()
-    GetRecordingHandler.driver.close()
     parseResult = urllib.parse.urlparse(GetRecordingHandler.URLs[-1])
     # ParseResult(scheme='http', netloc='localhost:8080', path='/', params='', query='',
     # fragment='access_token=blahblahblah&expires_in=1209600&token_type=bearer&site_id=1234&scope=')
@@ -305,6 +339,15 @@ class WordPressComCredential(WordPressCredential):
     # That actually means we grabbed the URL before it successfully redirected...
     # but that's impossible because we shouldn't grab the URL until we RECEIVE the request to localhost...
     # The browser/driver must have sent the request to localhost
+    if parseResult.netloc == 'public-api.wordpress.com' and parseResult.path == '/oauth2/authorize':
+      assert parseResult.params == ''
+      assert parseResult.fragment == ''
+      # wait for GetRecordingHandler magic text https://stackoverflow.com/questions/2014168/how-to-get-selenium-to-wait-for-a-transition-page-to-redirect-before-running-an
+      parseResult = urllib.parse.urlparse(GetRecordingHandler.driver.current_url)
+      if parseResult.netloc == 'public-api.wordpress.com' and parseResult.path == '/oauth2/authorize':
+        raise Exception("It appears we grabbed the URL before it successfully redirected. No idea how that can happen when we wait until receiving the localhost request before grabbing the URL. Try again?")
+    GetRecordingHandler.driver.close()
+
     if parseResult.query != '' or parseResult.netloc!='localhost:8080' or parseResult.params!='':
       raise Exception(parseResult)
     queryArgs = urllib.parse.parse_qs(parseResult.fragment)
@@ -312,11 +355,14 @@ class WordPressComCredential(WordPressCredential):
       raise Exception(queryArgs)
     assert 'scope' not in queryArgs
     assert len(queryArgs['token_type']) == 1 and queryArgs['token_type'][0] == 'bearer'
-    assert len(queryArgs['site_id']) == 1 and queryArgs['site_id'][0] == self.blog_id
+    if len(queryArgs['site_id']) != 1:
+      raise Exception(queryArgs['site_id'])
+    if queryArgs['site_id'][0] != self.blog_id:
+      raise Exception("The retrieved site_id was " + queryArgs['site_id'][0] + ", not " + self.blog_id + " as recorded in the config file. This ID may be correct; you may want to change the config file.")
     assert len(queryArgs['access_token']) == 1
     access_token = queryArgs['access_token'][0]
     if access_token != self.rawToken:
-      raise Exception('Token has changed:' + access_token)
+      raise Exception('The bearer token has changed from the value listed in the config file. This is not unusual, as the tokens change periodically. This new token is probably correct, and you probably want to change the file. Since % characters have special meaning in configparser, in the following token % characters have been escaped by doubling them: ' + access_token.replace('%', '%%'))
     #if access_token != requests_oauthlib.OAuth2Session().token_from_fragment(GetRecordingHandler.URLs[-1]):
     #  raise Exception(access_token, GetRecordingHandler.URLs[-1])
     #  throws an exception because http://localhost is HTTP rather than HTTPS
@@ -338,6 +384,7 @@ class WordPressSite(metaclass=abc.ABCMeta):
   def get_posts(self, session: requests.Session = None):
     session = session if session is not None else self.make_session()
     return requests.get(urllib.parse.urljoin(self.base_wp_v2_url(), 'posts'), proxies=session.proxies, verify=session.cert)
+
   def pages_url(self) -> str:
     """
     When using the /pages URL by itself, it makes no difference whether we include a / at the end.
@@ -345,12 +392,30 @@ class WordPressSite(metaclass=abc.ABCMeta):
     """
     noSlashAtEnd = urllib.parse.urljoin(self.base_wp_v2_url(), 'pages')
     return noSlashAtEnd + '/'
+
   def get_pages(self, session: requests.Session = None):
     # https://developer.wordpress.org/rest-api/reference/pages/
     session = session if session is not None else self.make_session()
-    response = requests.get(self.pages_url(), auth=session.auth, proxies=session.proxies, verify=session.cert)
+    pagesURL = self.pages_url()
+    parseResult = urllib.parse.urlparse(pagesURL)
+    assert parseResult.params == ''
+    # probably also need per_page
+    # https://developer.wordpress.org/rest-api/reference/pages/#list-pages
+    pagesURL = urllib.parse.urlunparse(parseResult._replace(query=urllib.parse.urlencode(dict(context='edit'))))
+    assert 'edit' in pagesURL
+    # content=edit is supposed to get you the raws https://stackoverflow.com/questions/50601970/how-to-get-raw-values-in-latest-wordpress-rest-api-v2
+    # https://github.com/WP-API/node-wpapi/issues/166
+    # https://make.xwp.co/2017/07/25/defining-context-in-the-wp-rest-api/
+    # The WordPress REST API doesn’t currently support a way to make a request that includes only individually requested fields in the response.
+    # the content field includes two properties: rendered and raw. The rendered field belongs to both the view and edit contexts, whereas the raw field only belongs to the edit context. The raw content will have unprocessed shortcodes, non-wptexturize‘d text, and line breaks untouched by wpautop. In contrast, the rendered field is the content after all the_content filters have been applied, just as it appears when viewed on the frontend.
+    # Our schemas also indicate the type each field is, provide a human-readable description, and show which contexts the field will be returned in.
+    # https://developer.wordpress.org/rest-api/reference/pages/#schema
+    # content simply says Context: view, edit; doesn't indicate that sub-parts of content are only returned for edit
+    # Unfortunately, that means that to get the raws, we need to have edit permissions.
+    # In the case of the edit context, the ability to request a resource with this context is restricted to users who can actually edit the post in the first place (as there also may be sensitive information in unprocessed shortcodes).
+    response = requests.get(pagesURL, auth=session.auth, proxies=session.proxies, verify=session.cert)
     if response.status_code != 200:
-      raise Exception(self.pages_url(), session, response)
+      raise Exception(pagesURL, session, response)
     assert response.headers['Content-Type'] == 'application/json; charset=UTF-8'
     assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
     return response
@@ -383,7 +448,12 @@ class WordPressSite(metaclass=abc.ABCMeta):
       os.makedirs(directoryToSaveThisPage, exist_ok=True)
       content = page['content']
       assert not content['protected']
-      assert len(content.keys()) == 2
+      # https://stackoverflow.com/questions/50601970/how-to-get-raw-values-in-latest-wordpress-rest-api-v2
+      # When requesting posts/pages/media with Wordpress Rest API v2 I used to receive a 'raw' and a 'rendered' value for fields like title, guid and content. With the latest Wordpress version the 'raw' fields seems to have vanished. I need the raw data as this is stable over time.
+      if content.keys() != set(['protected', 'raw', 'rendered', 'block_version']):
+        raise Exception(content.keys())
+      with open(os.path.join(directoryToSaveThisPage, 'content.raw.html'), 'w') as pageFile:
+        pageFile.write(content['raw'])
       with open(os.path.join(directoryToSaveThisPage, 'content.rendered.html'), 'w') as pageFile:
         pageFile.write(content['rendered'])
       with open(os.path.join(directoryToSaveThisPage, 'id'), 'w') as IDfile:
@@ -404,17 +474,17 @@ class WordPressComSite(WordPressSite):
 
   def get_pages_json(self, session: requests.Session = None):
     session = session if session is not None else self.make_session()
-    response = self.get_pages()
+    response = self.get_pages(session=session)
     assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
     # Access-Control-Allow-Headers sounds important but doesn't seem to matter:
-    assert 'Authorization' not in response.request.headers
+    assert 'Authorization' in response.request.headers # now that we're requesting in edit context to get the raws, we do have an Authorization
     assert 'Content-Type' not in response.request.headers
     assert len(response.request.headers) >= 4
     return response.json()
   def directory_to_save_pages(self):
     return self.blog_url
   def download_pages_nodefaults(self, directoryToSaveIn, session: requests.Session):
-    self.save_pages(self.get_pages_json(), directoryToSaveIn)
+    self.save_pages(self.get_pages_json(session=session), directoryToSaveIn)
 
 class WordPressMultisiteSite(WordPressSite):
   def __init__(self, site_path=get_site_path()):
@@ -440,7 +510,7 @@ class WordPressMultisiteSite(WordPressSite):
 
   def get_pages_json(self, session: requests.Session = None):
     session = session if session is not None else self.make_session()
-    response = self.get_pages()
+    response = self.get_pages(session=session)
     assert response.headers['Access-Control-Allow-Headers'] == 'Authorization, Content-Type'
     # Access-Control-Allow-Headers sounds important but doesn't seem to matter:
     assert 'Content-Type' not in response.request.headers
@@ -493,7 +563,7 @@ class WordPressMultisiteSite(WordPressSite):
   def directory_to_save_pages(self):
     return self.site_path
   def download_pages_nodefaults(self, directoryToSaveIn, session: requests.Session):
-    self.save_pages(self.get_pages_json(), directoryToSaveIn)
+    self.save_pages(self.get_pages_json(session=session), directoryToSaveIn)
   def do_extra_stuff_when_saving_page(self, page, directoryToSaveThisPage):
     sections = self.get_page_acf_sections(page['id'])
     if sections:

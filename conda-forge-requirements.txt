@@ -1,0 +1,2 @@
+# conda install --name python37env --channel conda-forge --file conda-forge-requirements.txt
+geckodriver

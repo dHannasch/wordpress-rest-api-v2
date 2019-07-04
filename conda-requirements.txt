@@ -1,0 +1,7 @@
+# conda install --name python37env --file conda-requirements.txt
+pykerberos
+# For some reason, pykerberos will not properly install via the requests_kerberos dependency.
+# But on the other side, requests_kerberos is not in standard conda channels.
+selenium
+beautifulsoup4
+sphinx
